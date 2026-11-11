@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import jwt
 import os
 import uvicorn
@@ -46,7 +46,6 @@ def verify_password(plain_password, hashed_password):
         return False
 
 def get_password_hash(password):
-    # 72 bytes limit for bcrypt
     pwd_bytes = password.encode('utf-8')[:72]
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(pwd_bytes, salt)
@@ -54,7 +53,7 @@ def get_password_hash(password):
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -78,13 +77,13 @@ def login(username: str, password: str, session: Session = Depends(get_session))
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
-    if user.valid_until < datetime.utcnow():
+    if user.valid_until < datetime.now(timezone.utc):
         raise HTTPException(status_code=403, detail="License expired")
     
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- Admin Endpoints (For API use) ---
+# --- Admin Endpoints ---
 @app.post("/admin/create_user")
 async def create_user(request: Request, session: Session = Depends(get_session)):
     try:
@@ -103,7 +102,7 @@ async def create_user(request: Request, session: Session = Depends(get_session))
         new_user = User(
             username=username,
             hashed_password=get_password_hash(password),
-            valid_until=datetime.utcnow() + timedelta(days=days_valid)
+            valid_until=datetime.now(timezone.utc) + timedelta(days=days_valid)
         )
         session.add(new_user)
         session.commit()
@@ -122,14 +121,14 @@ def delete_user(username: str, session: Session = Depends(get_session)):
     session.commit()
     return {"message": f"User {username} deleted"}
 
-# --- Web Admin Panel (Beautiful UI) ---
+# --- Web Admin Panel ---
 @app.get("/", response_class=HTMLResponse)
 def admin_panel(session: Session = Depends(get_session)):
     users = session.exec(select(User)).all()
     
     rows = ""
     for u in users:
-        status = "Active" if u.is_active and u.valid_until > datetime.utcnow() else "Expired/Disabled"
+        status = "Active" if u.is_active and u.valid_until > datetime.now(timezone.utc) else "Expired/Disabled"
         color = "green" if status == "Active" else "red"
         date_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
         rows += f"""
