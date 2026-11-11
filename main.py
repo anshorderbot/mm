@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Form
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -81,19 +81,32 @@ def login(username: str, password: str, session: Session = Depends(get_session))
 
 # --- Admin Endpoints (For API use) ---
 @app.post("/admin/create_user")
-def create_user(user_data: UserCreate, session: Session = Depends(get_session)):
-    existing = session.exec(select(User).where(User.username == user_data.username)).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    new_user = User(
-        username=user_data.username,
-        hashed_password=get_password_hash(user_data.password),
-        valid_until=datetime.utcnow() + timedelta(days=user_data.days_valid)
-    )
-    session.add(new_user)
-    session.commit()
-    return {"message": f"User {user_data.username} created"}
+async def create_user(request: Request, session: Session = Depends(get_session)):
+    try:
+        user_data = await request.json()
+        username = user_data.get("username")
+        password = user_data.get("password")
+        days_valid = int(user_data.get("days_valid", 30))
+
+        if not username or not password:
+            raise HTTPException(status_code=400, detail="Username and password required")
+
+        existing = session.exec(select(User).where(User.username == username)).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="User already exists")
+        
+        new_user = User(
+            username=username,
+            hashed_password=get_password_hash(password),
+            valid_until=datetime.utcnow() + timedelta(days=days_valid)
+        )
+        session.add(new_user)
+        session.commit()
+        return {"message": f"User {username} created successfully"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/admin/delete_user/{username}")
 def delete_user(username: str, session: Session = Depends(get_session)):
