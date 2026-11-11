@@ -4,3 +4,4 @@ sqlmodel
 pyjwt
 python-multipart
 bcrypt
+itsdangerous
