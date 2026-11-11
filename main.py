@@ -35,8 +35,8 @@ class User(SQLModel, table=True):
     plain_password: str = Field(default="")
     valid_until: datetime
     is_active: bool = Field(default=True)
-    session_token: str | None = Field(default=None, nullable=True) # Active session token
-    last_active: datetime | None = Field(default=None, nullable=True) # For checking if online
+    session_token: str | None = Field(default=None, nullable=True)
+    last_active: datetime | None = Field(default=None, nullable=True)
 
 class Token(BaseModel):
     access_token: str
@@ -98,14 +98,11 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    # Check if already logged in somewhere else
     now = datetime.now(timezone.utc)
     if user.session_token:
-        # If last active was within 60 seconds, block new login
         if user.last_active and (now - user.last_active).total_seconds() < 60:
-            raise HTTPException(status_code=403, detail="Already logged in on another device. Please logout there first.")
+            raise HTTPException(status_code=403, detail="Already logged in on another device.")
     
-    # Generate new session
     new_token = str(uuid.uuid4())
     user.session_token = new_token
     user.last_active = now
@@ -147,35 +144,9 @@ def root(request: Request):
 def admin_login_page(request: Request, error: str = None):
     error_html = f'<div class="message error" style="display:block;">{error}</div>' if error else ''
     return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Admin Login - Ghost Mailer</title>
-        <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background-color: #12141a; color: #eef0f4; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-            .login-box {{ background-color: #1a1d27; padding: 40px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #343a4a; width: 300px; text-align: center; }}
-            h2 {{ color: #f5a524; margin-bottom: 20px; }}
-            input {{ width: 100%; padding: 10px; margin-bottom: 15px; border-radius: 6px; border: 1px solid #343a4a; background-color: #242836; color: #eef0f4; box-sizing: border-box; outline: none; }}
-            input:focus {{ border-color: #f5a524; }}
-            button {{ width: 100%; padding: 10px; border: none; border-radius: 6px; background-color: #f5a524; color: #1a1208; font-weight: bold; cursor: pointer; }}
-            button:hover {{ background-color: #ffb84d; }}
-            .message {{ padding: 10px; margin-bottom: 15px; border-radius: 6px; font-size: 14px; }}
-            .error {{ background-color: #f07167; color: #fff; }}
-        </style>
-    </head>
-    <body>
-        <div class="login-box">
-            <h2>👻 Admin Login</h2>
-            {error_html}
-            <form action="/admin/login" method="POST">
-                <input type="text" name="username" placeholder="Admin Username" required>
-                <input type="password" name="password" placeholder="Admin Password" required>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </body>
-    </html>
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Admin Login</title>
+    <style>body{{font-family:'Segoe UI',sans-serif;background:#12141a;color:#eef0f4;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}}.login-box{{background:#1a1d27;padding:40px;border-radius:12px;box-shadow:0 4px 15px rgba(0,0,0,.5);border:1px solid #343a4a;width:300px;text-align:center}}h2{{color:#f5a524;margin-bottom:20px}}input{{width:100%;padding:10px;margin-bottom:15px;border-radius:6px;border:1px solid #343a4a;background:#242836;color:#eef0f4;box-sizing:border-box;outline:none}}input:focus{{border-color:#f5a524}}button{{width:100%;padding:10px;border:none;border-radius:6px;background:#f5a524;color:#1a1208;font-weight:bold;cursor:pointer}}button:hover{{background:#ffb84d}}.message{{padding:10px;margin-bottom:15px;border-radius:6px;font-size:14px}}.error{{background:#f07167;color:#fff}}</style></head>
+    <body><div class="login-box"><h2>👻 Admin Login</h2>{error_html}<form action="/admin/login" method="POST"><input type="text" name="username" placeholder="Admin Username" required><input type="password" name="password" placeholder="Admin Password" required><button type="submit">Login</button></form></div></body></html>
     """
 
 @app.post("/admin/login")
@@ -203,12 +174,9 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
     for u in users:
         status_text, color = ("Expired", "red") if u.valid_until < now else ("Active", "#2dd4bf")
         valid_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
-        
-        # Check Live Login Status
         is_online = False
         if u.session_token and u.last_active:
-            if (now - u.last_active).total_seconds() < 60: # 60 sec timeout for ping
-                is_online = True
+            if (now - u.last_active).total_seconds() < 60: is_online = True
                 
         if is_online:
             login_status = '<span style="color:#2dd4bf; font-weight:bold;">🟢 Logged In</span>'
@@ -220,13 +188,8 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
         rows += f"""
         <tr>
             <td><input type="checkbox" class="user-checkbox" value="{u.username}"></td>
-            <td>{u.id}</td>
-            <td><b>{u.username}</b></td>
-            <td style="color:#f5a524; font-family:monospace;">{u.plain_password}</td>
-            <td style="color:{color}; font-weight:bold;">{status_text}</td>
-            <td>{valid_str}</td>
-            <td>{login_status}</td>
-            <td>{action_btn}</td>
+            <td>{u.id}</td><td><b>{u.username}</b></td><td style="color:#f5a524; font-family:monospace;">{u.plain_password}</td>
+            <td style="color:{color}; font-weight:bold;">{status_text}</td><td>{valid_str}</td><td>{login_status}</td><td>{action_btn}</td>
         </tr>
         """
     
@@ -379,7 +342,6 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
     </html>
     """
 
-# --- Admin Create/Delete Endpoints ---
 @app.post("/admin/create_user")
 async def create_user(request: Request, session: Session = Depends(get_session)):
     if not verify_admin_cookie(request): raise HTTPException(status_code=403)
@@ -393,7 +355,7 @@ async def create_user(request: Request, session: Session = Depends(get_session))
         session.add(new_user); session.commit()
         
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
-        copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n───────────────────────────────\nUsername: {username}\nPassword: {password}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n───────────────────────────────\nUsername: {username}\nPassword: {password}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n🔗 Login URL: https://mm-production-d4739aa7.up.railway.app/login"
         return {"message": f"User {username} created", "copy_text": copy_text}
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
@@ -413,7 +375,7 @@ async def batch_create(request: Request, session: Session = Depends(get_session)
                 created.append(uname)
         session.commit()
         
-        copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n───────────────────────────────\nTotal: {len(created)}\nPassword: {pwd}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n" + "\n".join(created) + f"\n───────────────────────────────\n🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n───────────────────────────────\nTotal: {len(created)}\nPassword: {pwd}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n" + "\n".join(created) + f"\n───────────────────────────────\n🔗 Login URL: https://mm-production-d4739aa7.up.railway.app/login"
         return {"message": f"Created {len(created)} users", "copy_text": copy_text}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
