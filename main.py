@@ -2,11 +2,11 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
 import os
 import uvicorn
+import bcrypt
 
 # --- Configuration ---
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
@@ -38,16 +38,19 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-# --- Security ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
+# --- Security (Direct bcrypt, no passlib) ---
 def verify_password(plain_password, hashed_password):
-    plain_password = plain_password[:72]
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except Exception:
+        return False
 
 def get_password_hash(password):
-    password = password[:72]
-    return pwd_context.hash(password)
+    # 72 bytes limit for bcrypt
+    pwd_bytes = password.encode('utf-8')[:72]
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(pwd_bytes, salt)
+    return hashed.decode('utf-8')
 
 def create_access_token(data: dict):
     to_encode = data.copy()
