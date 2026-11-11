@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, Form, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Request, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -8,15 +8,15 @@ import jwt
 import os
 import uvicorn
 import bcrypt
+import uuid
 
 # --- Configuration ---
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
 # --- Admin Credentials ---
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123" # Change this!
+ADMIN_PASSWORD = "admin123" 
 ADMIN_SECRET_KEY = "my-super-secret-admin-cookie-key-123"
 
 # --- Database Setup ---
@@ -32,32 +32,31 @@ class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(unique=True, index=True)
     hashed_password: str
-    plain_password: str = Field(default="") # For Admin display only
+    plain_password: str = Field(default="")
     valid_until: datetime
     is_active: bool = Field(default=True)
-    last_login: datetime | None = Field(default=None, nullable=True)
+    session_token: str | None = Field(default=None, nullable=True) # Active session token
+    last_active: datetime | None = Field(default=None, nullable=True) # For checking if online
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
+class PingRequest(BaseModel):
+    username: str
+    token: str
+
 # --- Security Helpers ---
 def verify_password(plain_password, hashed_password):
-    try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except Exception:
-        return False
+    try: return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except: return False
 
 def get_password_hash(password):
-    pwd_bytes = password.encode('utf-8')[:72]
-    salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(pwd_bytes, salt)
-    return hashed.decode('utf-8')
+    return bcrypt.hashpw(password.encode('utf-8')[:72], bcrypt.gensalt()).decode('utf-8')
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": datetime.now(timezone.utc) + timedelta(days=7)})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_session():
@@ -66,26 +65,16 @@ def get_session():
 
 # --- Admin Auth Helpers ---
 serializer = URLSafeTimedSerializer(ADMIN_SECRET_KEY)
-
-def create_admin_cookie(username: str):
-    return serializer.dumps({"admin": username})
-
 def verify_admin_cookie(request: Request):
     cookie = request.cookies.get("admin_session")
     if not cookie: return False
-    try:
-        data = serializer.loads(cookie, max_age=86400)
-        return data.get("admin") == ADMIN_USERNAME
-    except (BadSignature, SignatureExpired):
-        return False
+    try: return serializer.loads(cookie, max_age=86400).get("admin") == ADMIN_USERNAME
+    except: return False
 
-# --- Auto Delete Expired Users ---
 def delete_expired_users(session: Session):
     now = datetime.now(timezone.utc)
-    statement = select(User).where(User.valid_until < now)
-    expired_users = session.exec(statement).all()
-    for user in expired_users:
-        session.delete(user)
+    expired_users = session.exec(select(User).where(User.valid_until < now)).all()
+    for u in expired_users: session.delete(u)
     session.commit()
 
 # --- App ---
@@ -95,34 +84,63 @@ app = FastAPI()
 def on_startup():
     create_db_and_tables()
 
-# --- Client Login Endpoint ---
+# --- Client API Endpoints ---
 @app.post("/login", response_model=Token)
 def login(username: str, password: str, session: Session = Depends(get_session)):
     user = session.exec(select(User).where(User.username == username)).first()
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    now = datetime.now(timezone.utc)
-    if user.valid_until < now:
-        session.delete(user)
-        session.commit()
+    if user.valid_until < datetime.now(timezone.utc):
+        session.delete(user); session.commit()
         raise HTTPException(status_code=403, detail="License expired. User deleted.")
         
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
+
+    # Check if already logged in somewhere else
+    now = datetime.now(timezone.utc)
+    if user.session_token:
+        # If last active was within 60 seconds, block new login
+        if user.last_active and (now - user.last_active).total_seconds() < 60:
+            raise HTTPException(status_code=403, detail="Already logged in on another device. Please logout there first.")
     
-    user.last_login = now
-    session.add(user)
-    session.commit()
+    # Generate new session
+    new_token = str(uuid.uuid4())
+    user.session_token = new_token
+    user.last_active = now
+    session.add(user); session.commit()
     
-    access_token = create_access_token(data={"sub": user.username})
+    access_token = create_access_token(data={"sub": user.username, "session": new_token})
     return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/ping")
+def ping(req: PingRequest, session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == req.username)).first()
+    if not user or user.session_token != req.token:
+        raise HTTPException(status_code=401, detail="Session invalid or logged out by admin")
+    
+    if user.valid_until < datetime.now(timezone.utc):
+        session.delete(user); session.commit()
+        raise HTTPException(status_code=401, detail="License expired")
+        
+    user.last_active = datetime.now(timezone.utc)
+    session.add(user); session.commit()
+    return {"status": "ok"}
+
+@app.post("/logout")
+def client_logout(req: PingRequest, session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == req.username)).first()
+    if user and user.session_token == req.token:
+        user.session_token = None
+        user.last_active = None
+        session.add(user); session.commit()
+    return {"status": "logged_out"}
 
 # --- Admin Routes ---
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request):
-    if not verify_admin_cookie(request):
-        return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
+    if not verify_admin_cookie(request): return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/admin/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/admin/login", response_class=HTMLResponse)
@@ -164,11 +182,9 @@ def admin_login_page(request: Request, error: str = None):
 def admin_login(username: str = Form(...), password: str = Form(...)):
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         response = RedirectResponse(url="/admin/dashboard", status_code=status.HTTP_303_SEE_OTHER)
-        cookie_val = create_admin_cookie(username)
-        response.set_cookie(key="admin_session", value=cookie_val, httponly=True, max_age=86400)
+        response.set_cookie(key="admin_session", value=serializer.dumps({"admin": username}), httponly=True, max_age=86400)
         return response
-    else:
-        return RedirectResponse(url="/admin/login?error=Invalid+credentials", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(url="/admin/login?error=Invalid+credentials", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.get("/admin/logout")
 def admin_logout():
@@ -178,30 +194,39 @@ def admin_logout():
 
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 def admin_dashboard(request: Request, session: Session = Depends(get_session)):
-    if not verify_admin_cookie(request):
-        return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
-    
+    if not verify_admin_cookie(request): return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     delete_expired_users(session)
-    
     users = session.exec(select(User).order_by(User.id.desc())).all()
     
     rows = ""
+    now = datetime.now(timezone.utc)
     for u in users:
-        now = datetime.now(timezone.utc)
         status_text, color = ("Expired", "red") if u.valid_until < now else ("Active", "#2dd4bf")
         valid_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
-        last_login_str = u.last_login.strftime("%Y-%m-%d %H:%M") if u.last_login else "Never"
-        pw_display = u.plain_password if u.plain_password else "••••••"
         
+        # Check Live Login Status
+        is_online = False
+        if u.session_token and u.last_active:
+            if (now - u.last_active).total_seconds() < 60: # 60 sec timeout for ping
+                is_online = True
+                
+        if is_online:
+            login_status = '<span style="color:#2dd4bf; font-weight:bold;">🟢 Logged In</span>'
+            action_btn = f'<button onclick="forceLogout(\'{u.username}\')" class="btn btn-force-logout">Force Logout</button>'
+        else:
+            login_status = '<span style="color:#8b93a7;">🔴 Offline</span>'
+            action_btn = '-'
+            
         rows += f"""
         <tr>
             <td><input type="checkbox" class="user-checkbox" value="{u.username}"></td>
             <td>{u.id}</td>
             <td><b>{u.username}</b></td>
-            <td style="color:#f5a524; font-family:monospace;">{pw_display}</td>
+            <td style="color:#f5a524; font-family:monospace;">{u.plain_password}</td>
             <td style="color:{color}; font-weight:bold;">{status_text}</td>
             <td>{valid_str}</td>
-            <td style="color:#8b93a7;">{last_login_str}</td>
+            <td>{login_status}</td>
+            <td>{action_btn}</td>
         </tr>
         """
     
@@ -215,39 +240,27 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             body {{ font-family: 'Segoe UI', sans-serif; background-color: #12141a; color: #eef0f4; margin: 0; padding: 20px; }}
             .container {{ max-width: 1200px; margin: auto; background-color: #1a1d27; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #343a4a; }}
             .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 2px solid #343a4a; padding-bottom: 15px; }}
-            h1 {{ color: #f5a524; margin: 0; }}
-            h2 {{ color: #f5a524; margin-top: 0; font-size: 18px; }}
+            h1 {{ color: #f5a524; margin: 0; }} h2 {{ color: #f5a524; margin-top: 0; font-size: 18px; }}
             .btn {{ padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; transition: 0.2s; }}
             .btn-logout {{ background-color: #f07167; color: white; }}
-            .btn-logout:hover {{ background-color: #ff5c50; }}
             .btn-primary {{ background-color: #f5a524; color: #1a1208; }}
-            .btn-primary:hover {{ background-color: #ffb84d; }}
             .btn-delete {{ background-color: transparent; color: #f07167; border: 1px solid #f07167; padding: 8px 15px; font-size: 13px; border-radius: 6px; cursor:pointer; font-weight:bold;}}
-            .btn-delete:hover {{ background-color: #f07167; color: white; }}
+            .btn-force-logout {{ background-color: transparent; color: #f5a524; border: 1px solid #f5a524; padding: 5px 10px; font-size: 12px; border-radius: 4px; cursor:pointer; }}
             
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
             .box {{ background-color: #242836; padding: 20px; border-radius: 8px; border: 1px solid #343a4a; }}
-            
             input[type="text"], input[type="password"], input[type="number"] {{ width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #343a4a; background-color: #1a1d27; color: #eef0f4; box-sizing: border-box; outline: none; }}
-            input:focus {{ border-color: #f5a524; }}
             
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
             th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #343a4a; }}
             th {{ color: #8b93a7; font-size: 13px; text-transform: uppercase; }}
             tr:hover {{ background-color: #2a2e3d; }}
             
-            .action-bar {{ display: flex; justify-content: space-between; align-items: center; margin-top: 30px; }}
-            
-            /* Copyable Result Box Styling */
-            .result-box {{ display: none; background: linear-gradient(135deg, #1a1d27, #242836); border: 1px solid #f5a524; border-radius: 8px; padding: 20px; margin-bottom: 20px; position: relative; box-shadow: 0 0 15px rgba(245,165,36,0.2); }}
-            .result-box h3 {{ color: #f5a524; margin-top: 0; display: flex; align-items: center; gap: 10px; font-size: 18px; }}
-            .result-text {{ background-color: #0e1016; padding: 15px; border-radius: 6px; color: #eef0f4; font-family: monospace; white-space: pre-wrap; font-size: 14px; line-height: 1.5; max-height: 200px; overflow-y: auto; }}
+            .result-box {{ display: none; background: linear-gradient(135deg, #1a1d27, #242836); border: 1px solid #f5a524; border-radius: 8px; padding: 20px; margin-bottom: 20px; position: relative; }}
+            .result-box h3 {{ color: #f5a524; margin-top: 0; }} .result-text {{ background-color: #0e1016; padding: 15px; border-radius: 6px; color: #eef0f4; font-family: monospace; white-space: pre-wrap; font-size: 14px; max-height: 200px; overflow-y: auto; }}
             .btn-copy {{ position: absolute; top: 15px; right: 15px; background-color: #2dd4bf; color: #000; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }}
-            .btn-copy:hover {{ background-color: #4ae3d0; }}
-            
             .message {{ text-align: center; padding: 10px; margin-bottom: 20px; border-radius: 6px; display: none; }}
-            .success {{ background-color: #2dd4bf; color: #000; }}
-            .error {{ background-color: #f07167; color: #fff; }}
+            .success {{ background-color: #2dd4bf; color: #000; }} .error {{ background-color: #f07167; color: #fff; }}
         </style>
     </head>
     <body>
@@ -258,8 +271,6 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             </div>
             
             <div id="message" class="message"></div>
-
-            <!-- Success Box (For Copy) -->
             <div id="resultBox" class="result-box">
                 <h3>🎉 Generated Users</h3>
                 <button class="btn-copy" onclick="copyResults()">Copy to Clipboard</button>
@@ -267,7 +278,6 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             </div>
 
             <div class="grid">
-                <!-- Single User -->
                 <div class="box">
                     <h2>Create Single User</h2>
                     <form id="createSingleForm">
@@ -277,8 +287,6 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                         <button type="submit" class="btn btn-primary" style="width:100%;">Create User</button>
                     </form>
                 </div>
-                
-                <!-- Batch User (Quantity) -->
                 <div class="box">
                     <h2>Batch Generator</h2>
                     <form id="createBatchForm">
@@ -291,7 +299,7 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                 </div>
             </div>
 
-            <div class="action-bar">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:30px;">
                 <h2>User List</h2>
                 <button type="button" class="btn btn-delete" onclick="deleteSelected()">Delete Selected</button>
             </div>
@@ -300,246 +308,136 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                 <thead>
                     <tr>
                         <th><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th>
-                        <th>ID</th>
-                        <th>Username</th>
-                        <th>Password</th>
-                        <th>Status</th>
-                        <th>Valid Until</th>
-                        <th>Last Login</th>
+                        <th>ID</th><th>Username</th><th>Password</th><th>Status</th><th>Valid Until</th><th>Live Status</th><th>Action</th>
                     </tr>
                 </thead>
-                <tbody id="userTable">
-                    {rows if rows else '<tr><td colspan="7" style="text-align:center;">No users found.</td></tr>'}
-                </tbody>
+                <tbody>{rows if rows else '<tr><td colspan="8" style="text-align:center;">No users found.</td></tr>'}</tbody>
             </table>
         </div>
 
         <script>
             let generatedText = "";
-
             function showMsg(text, isError) {{
                 const msg = document.getElementById('message');
                 msg.className = 'message ' + (isError ? 'error' : 'success');
-                msg.innerText = text;
-                msg.style.display = 'block';
+                msg.innerText = text; msg.style.display = 'block';
                 setTimeout(() => {{ msg.style.display = 'none'; }}, 3000);
             }}
-
-            function toggleAll(source) {{
-                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = source.checked);
-            }}
-
+            function toggleAll(source) {{ document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = source.checked); }}
             function showResultBox(text) {{
-                generatedText = text;
-                document.getElementById('resultText').innerText = text;
+                generatedText = text; document.getElementById('resultText').innerText = text;
                 document.getElementById('resultBox').style.display = 'block';
                 window.scrollTo({{ top: 0, behavior: 'smooth' }});
             }}
+            function copyResults() {{ navigator.clipboard.writeText(generatedText).then(() => showMsg('Copied!', false)); }}
 
-            function copyResults() {{
-                navigator.clipboard.writeText(generatedText).then(() => {{
-                    showMsg('Copied to clipboard!', false);
-                }});
-            }}
-
-            // Single Create
             document.getElementById('createSingleForm').addEventListener('submit', async function(e) {{
-                e.preventDefault();
-                const btn = e.target.querySelector('button');
-                btn.innerText = 'Creating...'; btn.disabled = true;
-                
-                const data = {{
-                    username: document.getElementById('s_username').value,
-                    password: document.getElementById('s_password').value,
-                    days_valid: parseInt(document.getElementById('s_days').value)
-                }};
-
+                e.preventDefault(); const btn = e.target.querySelector('button'); btn.innerText = '...'; btn.disabled = true;
+                const data = {{ username: document.getElementById('s_username').value, password: document.getElementById('s_password').value, days_valid: parseInt(document.getElementById('s_days').value) }};
                 try {{
-                    const res = await fetch('/admin/create_user', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify(data)
-                    }});
+                    const res = await fetch('/admin/create_user', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(data) }});
                     const result = await res.json();
-                    if (res.ok) {{
-                        showMsg(result.message, false);
-                        showResultBox(result.copy_text);
-                        e.target.reset();
-                        setTimeout(() => location.reload(), 5000); // 5 sec baad reload taaki copy kr ske
-                    }} else {{
-                        showMsg(result.detail || 'Error', true);
-                    }}
-                }} catch (err) {{
-                    showMsg('Network error!', true);
-                }} finally {{
-                    btn.innerText = 'Create User'; btn.disabled = false;
-                }}
+                    if (res.ok) {{ showMsg(result.message, false); showResultBox(result.copy_text); e.target.reset(); setTimeout(() => location.reload(), 5000); }}
+                    else showMsg(result.detail || 'Error', true);
+                }} catch (err) {{ showMsg('Network error!', true); }} finally {{ btn.innerText = 'Create User'; btn.disabled = false; }}
             }});
 
-            // Batch Create
             document.getElementById('createBatchForm').addEventListener('submit', async function(e) {{
-                e.preventDefault();
-                const btn = e.target.querySelector('button');
-                btn.innerText = 'Generating...'; btn.disabled = true;
-                
-                const data = {{
-                    base_username: document.getElementById('b_username').value,
-                    password: document.getElementById('b_password').value,
-                    days_valid: parseInt(document.getElementById('b_days').value),
-                    quantity: parseInt(document.getElementById('b_qty').value)
-                }};
-
+                e.preventDefault(); const btn = e.target.querySelector('button'); btn.innerText = '...'; btn.disabled = true;
+                const data = {{ base_username: document.getElementById('b_username').value, password: document.getElementById('b_password').value, days_valid: parseInt(document.getElementById('b_days').value), quantity: parseInt(document.getElementById('b_qty').value) }};
                 try {{
-                    const res = await fetch('/admin/batch_create', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify(data)
-                    }});
+                    const res = await fetch('/admin/batch_create', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify(data) }});
                     const result = await res.json();
-                    if (res.ok) {{
-                        showMsg(result.message, false);
-                        showResultBox(result.copy_text);
-                        e.target.reset();
-                        setTimeout(() => location.reload(), 5000);
-                    }} else {{
-                        showMsg(result.detail || 'Error', true);
-                    }}
-                }} catch (err) {{
-                    showMsg('Network error!', true);
-                }} finally {{
-                    btn.innerText = 'Generate Batch'; btn.disabled = false;
-                }}
+                    if (res.ok) {{ showMsg(result.message, false); showResultBox(result.copy_text); e.target.reset(); setTimeout(() => location.reload(), 5000); }}
+                    else showMsg(result.detail || 'Error', true);
+                }} catch (err) {{ showMsg('Network error!', true); }} finally {{ btn.innerText = 'Generate Batch'; btn.disabled = false; }}
             }});
 
-            // Bulk Delete
             async function deleteSelected() {{
                 const checkboxes = document.querySelectorAll('.user-checkbox:checked');
-                if (checkboxes.length === 0) return showMsg('Please select users to delete.', true);
-                
-                if (!confirm(`Are you sure you want to delete ${{checkboxes.length}} users?`)) return;
-                
+                if (checkboxes.length === 0) return showMsg('Select users to delete.', true);
+                if (!confirm(`Delete ${{checkboxes.length}} users?`)) return;
                 const usernames = Array.from(checkboxes).map(cb => cb.value);
-                
                 try {{
-                    const res = await fetch('/admin/bulk_delete', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ usernames: usernames }})
-                    }});
+                    const res = await fetch('/admin/bulk_delete', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: JSON.stringify({{ usernames: usernames }}) }});
                     const result = await res.json();
-                    if (res.ok) {{
-                        showMsg(result.message, false);
-                        setTimeout(() => location.reload(), 1000);
-                    }} else {{
-                        showMsg(result.detail || 'Error', true);
-                    }}
-                }} catch (err) {{
-                    showMsg('Network error!', true);
-                }}
+                    if (res.ok) {{ showMsg(result.message, false); setTimeout(() => location.reload(), 1000); }}
+                    else showMsg(result.detail || 'Error', true);
+                }} catch (err) {{ showMsg('Network error!', true); }}
+            }}
+
+            async function forceLogout(username) {{
+                if (!confirm(`Force logout ${{username}}?`)) return;
+                try {{
+                    const res = await fetch(`/admin/force_logout/${{username}}`, {{ method: 'POST' }});
+                    if (res.ok) {{ showMsg('User logged out successfully!', false); setTimeout(() => location.reload(), 1000); }}
+                    else showMsg('Error', true);
+                }} catch (err) {{ showMsg('Network error!', true); }}
             }}
         </script>
     </body>
     </html>
     """
 
-# --- Admin API Endpoints ---
+# --- Admin Create/Delete Endpoints ---
 @app.post("/admin/create_user")
 async def create_user(request: Request, session: Session = Depends(get_session)):
-    if not verify_admin_cookie(request): raise HTTPException(status_code=403, detail="Not authenticated")
+    if not verify_admin_cookie(request): raise HTTPException(status_code=403)
     try:
         data = await request.json()
         username, password, days = data.get("username"), data.get("password"), int(data.get("days_valid"))
+        if not username or not password: raise HTTPException(status_code=400, detail="Required fields missing")
+        if session.exec(select(User).where(User.username == username)).first(): raise HTTPException(status_code=400, detail="User exists")
         
-        if not username or not password: raise HTTPException(status_code=400, detail="Username/Password required")
-        if session.exec(select(User).where(User.username == username)).first():
-            raise HTTPException(status_code=400, detail="User already exists")
-        
-        new_user = User(
-            username=username,
-            hashed_password=get_password_hash(password),
-            plain_password=password,
-            valid_until=datetime.now(timezone.utc) + timedelta(days=days)
-        )
+        new_user = User(username=username, hashed_password=get_password_hash(password), plain_password=password, valid_until=datetime.now(timezone.utc) + timedelta(days=days))
         session.add(new_user); session.commit()
         
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
-        copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n"
-        copy_text += f"───────────────────────────────\n"
-        copy_text += f"Username: {username}\n"
-        copy_text += f"Password: {password}\n"
-        copy_text += f"Valid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n"
-        copy_text += f"───────────────────────────────\n"
-        copy_text += f"🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
-        
-        return {"message": f"User {username} created successfully", "copy_text": copy_text}
+        copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n───────────────────────────────\nUsername: {username}\nPassword: {password}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        return {"message": f"User {username} created", "copy_text": copy_text}
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/batch_create")
 async def batch_create(request: Request, session: Session = Depends(get_session)):
-    if not verify_admin_cookie(request): raise HTTPException(status_code=403, detail="Not authenticated")
+    if not verify_admin_cookie(request): raise HTTPException(status_code=403)
     try:
         data = await request.json()
-        base_username = data.get("base_username")
-        password = data.get("password")
-        days = int(data.get("days_valid"))
-        qty = int(data.get("quantity"))
-
-        if not base_username or not password or qty <= 0: 
-            raise HTTPException(status_code=400, detail="Invalid input")
-        
-        created_users = []
+        base, pwd, days, qty = data.get("base_username"), data.get("password"), int(data.get("days_valid")), int(data.get("quantity"))
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
-        
+        created = []
         for i in range(1, qty + 1):
-            uname = f"{base_username}{i}"
+            uname = f"{base}{i}"
             if not session.exec(select(User).where(User.username == uname)).first():
-                new_user = User(
-                    username=uname,
-                    hashed_password=get_password_hash(password),
-                    plain_password=password,
-                    valid_until=expiry
-                )
-                session.add(new_user)
-                created_users.append(uname)
-        
+                session.add(User(username=uname, hashed_password=get_password_hash(pwd), plain_password=pwd, valid_until=expiry))
+                created.append(uname)
         session.commit()
         
-        copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n"
-        copy_text += f"───────────────────────────────\n"
-        copy_text += f"Total Users: {len(created_users)}\n"
-        copy_text += f"Password: {password}\n"
-        copy_text += f"Valid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n"
-        copy_text += f"───────────────────────────────\n"
-        for u in created_users:
-            copy_text += f"{u}\n"
-        copy_text += f"───────────────────────────────\n"
-        copy_text += f"🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
-        
-        return {"message": f"Successfully created {len(created_users)} users", "copy_text": copy_text}
-    except HTTPException: raise
+        copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n───────────────────────────────\nTotal: {len(created)}\nPassword: {pwd}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n" + "\n".join(created) + f"\n───────────────────────────────\n🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        return {"message": f"Created {len(created)} users", "copy_text": copy_text}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/bulk_delete")
 async def bulk_delete(request: Request, session: Session = Depends(get_session)):
-    if not verify_admin_cookie(request): raise HTTPException(status_code=403, detail="Not authenticated")
+    if not verify_admin_cookie(request): raise HTTPException(status_code=403)
     try:
         data = await request.json()
-        usernames = data.get("usernames", [])
-        if not usernames: raise HTTPException(status_code=400, detail="No users selected")
-        
-        deleted = 0
-        for uname in usernames:
+        for uname in data.get("usernames", []):
             user = session.exec(select(User).where(User.username == uname)).first()
-            if user:
-                session.delete(user)
-                deleted += 1
+            if user: session.delete(user)
         session.commit()
-        return {"message": f"Successfully deleted {deleted} users"}
-    except HTTPException: raise
+        return {"message": "Users deleted"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
-# --- Run Server ---
+@app.post("/admin/force_logout/{username}")
+async def force_logout(username: str, request: Request, session: Session = Depends(get_session)):
+    if not verify_admin_cookie(request): raise HTTPException(status_code=403)
+    user = session.exec(select(User).where(User.username == username)).first()
+    if user:
+        user.session_token = None
+        user.last_active = None
+        session.add(user); session.commit()
+    return {"status": "ok"}
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
