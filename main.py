@@ -8,8 +8,6 @@ import jwt
 import os
 import uvicorn
 import bcrypt
-import csv
-import io
 
 # --- Configuration ---
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
@@ -18,7 +16,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 days
 
 # --- Admin Credentials ---
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123" # Apna password yahan badal lena
+ADMIN_PASSWORD = "admin123" # Change this!
 ADMIN_SECRET_KEY = "my-super-secret-admin-cookie-key-123"
 
 # --- Database Setup ---
@@ -34,9 +32,10 @@ class User(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(unique=True, index=True)
     hashed_password: str
+    plain_password: str = Field(default="") # For Admin display only
     valid_until: datetime
     is_active: bool = Field(default=True)
-    last_login: datetime | None = Field(default=None, nullable=True) # Naya field
+    last_login: datetime | None = Field(default=None, nullable=True)
 
 class Token(BaseModel):
     access_token: str
@@ -75,7 +74,7 @@ def verify_admin_cookie(request: Request):
     cookie = request.cookies.get("admin_session")
     if not cookie: return False
     try:
-        data = serializer.loads(cookie, max_age=86400) # 24 hours
+        data = serializer.loads(cookie, max_age=86400)
         return data.get("admin") == ADMIN_USERNAME
     except (BadSignature, SignatureExpired):
         return False
@@ -112,7 +111,6 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
     
-    # Update last login
     user.last_login = now
     session.add(user)
     session.commit()
@@ -183,28 +181,24 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
     if not verify_admin_cookie(request):
         return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     
-    # Delete expired users before loading
     delete_expired_users(session)
     
     users = session.exec(select(User).order_by(User.id.desc())).all()
     
     rows = ""
     for u in users:
-        # Status Logic
         now = datetime.now(timezone.utc)
-        if u.valid_until < now:
-            status_text, color = "Expired", "red"
-        else:
-            status_text, color = "Active", "#2dd4bf"
-            
+        status_text, color = ("Expired", "red") if u.valid_until < now else ("Active", "#2dd4bf")
         valid_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
         last_login_str = u.last_login.strftime("%Y-%m-%d %H:%M") if u.last_login else "Never"
+        pw_display = u.plain_password if u.plain_password else "••••••"
         
         rows += f"""
         <tr>
             <td><input type="checkbox" class="user-checkbox" value="{u.username}"></td>
             <td>{u.id}</td>
             <td><b>{u.username}</b></td>
+            <td style="color:#f5a524; font-family:monospace;">{pw_display}</td>
             <td style="color:{color}; font-weight:bold;">{status_text}</td>
             <td>{valid_str}</td>
             <td style="color:#8b93a7;">{last_login_str}</td>
@@ -219,22 +213,22 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
         <title>Admin Dashboard - Ghost Mailer</title>
         <style>
             body {{ font-family: 'Segoe UI', sans-serif; background-color: #12141a; color: #eef0f4; margin: 0; padding: 20px; }}
-            .container {{ max-width: 1100px; margin: auto; background-color: #1a1d27; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #343a4a; }}
+            .container {{ max-width: 1200px; margin: auto; background-color: #1a1d27; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #343a4a; }}
             .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 2px solid #343a4a; padding-bottom: 15px; }}
             h1 {{ color: #f5a524; margin: 0; }}
-            h2 {{ color: #f5a524; margin-top: 30px; }}
+            h2 {{ color: #f5a524; margin-top: 0; font-size: 18px; }}
             .btn {{ padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; transition: 0.2s; }}
             .btn-logout {{ background-color: #f07167; color: white; }}
             .btn-logout:hover {{ background-color: #ff5c50; }}
             .btn-primary {{ background-color: #f5a524; color: #1a1208; }}
             .btn-primary:hover {{ background-color: #ffb84d; }}
-            .btn-delete {{ background-color: transparent; color: #f07167; border: 1px solid #f07167; padding: 5px 10px; font-size: 12px; }}
+            .btn-delete {{ background-color: transparent; color: #f07167; border: 1px solid #f07167; padding: 8px 15px; font-size: 13px; border-radius: 6px; cursor:pointer; font-weight:bold;}}
             .btn-delete:hover {{ background-color: #f07167; color: white; }}
             
-            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
             .box {{ background-color: #242836; padding: 20px; border-radius: 8px; border: 1px solid #343a4a; }}
             
-            input[type="text"], input[type="password"], input[type="number"], input[type="file"] {{ width: 100%; padding: 10px; margin-bottom: 15px; border-radius: 6px; border: 1px solid #343a4a; background-color: #1a1d27; color: #eef0f4; box-sizing: border-box; outline: none; }}
+            input[type="text"], input[type="password"], input[type="number"] {{ width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #343a4a; background-color: #1a1d27; color: #eef0f4; box-sizing: border-box; outline: none; }}
             input:focus {{ border-color: #f5a524; }}
             
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
@@ -242,7 +236,15 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             th {{ color: #8b93a7; font-size: 13px; text-transform: uppercase; }}
             tr:hover {{ background-color: #2a2e3d; }}
             
-            .action-bar {{ display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }}
+            .action-bar {{ display: flex; justify-content: space-between; align-items: center; margin-top: 30px; }}
+            
+            /* Copyable Result Box Styling */
+            .result-box {{ display: none; background: linear-gradient(135deg, #1a1d27, #242836); border: 1px solid #f5a524; border-radius: 8px; padding: 20px; margin-bottom: 20px; position: relative; box-shadow: 0 0 15px rgba(245,165,36,0.2); }}
+            .result-box h3 {{ color: #f5a524; margin-top: 0; display: flex; align-items: center; gap: 10px; font-size: 18px; }}
+            .result-text {{ background-color: #0e1016; padding: 15px; border-radius: 6px; color: #eef0f4; font-family: monospace; white-space: pre-wrap; font-size: 14px; line-height: 1.5; max-height: 200px; overflow-y: auto; }}
+            .btn-copy {{ position: absolute; top: 15px; right: 15px; background-color: #2dd4bf; color: #000; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }}
+            .btn-copy:hover {{ background-color: #4ae3d0; }}
+            
             .message {{ text-align: center; padding: 10px; margin-bottom: 20px; border-radius: 6px; display: none; }}
             .success {{ background-color: #2dd4bf; color: #000; }}
             .error {{ background-color: #f07167; color: #fff; }}
@@ -257,25 +259,34 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             
             <div id="message" class="message"></div>
 
+            <!-- Success Box (For Copy) -->
+            <div id="resultBox" class="result-box">
+                <h3>🎉 Generated Users</h3>
+                <button class="btn-copy" onclick="copyResults()">Copy to Clipboard</button>
+                <div id="resultText" class="result-text"></div>
+            </div>
+
             <div class="grid">
                 <!-- Single User -->
                 <div class="box">
                     <h2>Create Single User</h2>
                     <form id="createSingleForm">
-                        <input type="text" id="username" placeholder="Username" required>
-                        <input type="password" id="password" placeholder="Password" required>
-                        <input type="number" id="days" placeholder="Validity (Days)" required>
+                        <input type="text" id="s_username" placeholder="Username" required>
+                        <input type="text" id="s_password" placeholder="Password" required>
+                        <input type="number" id="s_days" placeholder="Validity (Days)" required>
                         <button type="submit" class="btn btn-primary" style="width:100%;">Create User</button>
                     </form>
                 </div>
                 
-                <!-- Batch User -->
+                <!-- Batch User (Quantity) -->
                 <div class="box">
-                    <h2>Batch Upload (CSV)</h2>
-                    <p style="font-size:12px; color:#8b93a7; margin-bottom:10px;">Format: username,password,days (1 user per line)</p>
+                    <h2>Batch Generator</h2>
                     <form id="createBatchForm">
-                        <input type="file" id="csvFile" accept=".csv" required>
-                        <button type="submit" class="btn btn-primary" style="width:100%;">Upload & Create</button>
+                        <input type="text" id="b_username" placeholder="Base Username (e.g. ghost)" required>
+                        <input type="text" id="b_password" placeholder="Common Password" required>
+                        <input type="number" id="b_days" placeholder="Validity (Days)" required>
+                        <input type="number" id="b_qty" placeholder="Quantity (e.g. 10)" required>
+                        <button type="submit" class="btn btn-primary" style="width:100%;">Generate Batch</button>
                     </form>
                 </div>
             </div>
@@ -291,18 +302,21 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                         <th><input type="checkbox" id="selectAll" onclick="toggleAll(this)"></th>
                         <th>ID</th>
                         <th>Username</th>
+                        <th>Password</th>
                         <th>Status</th>
                         <th>Valid Until</th>
                         <th>Last Login</th>
                     </tr>
                 </thead>
                 <tbody id="userTable">
-                    {rows if rows else '<tr><td colspan="6" style="text-align:center;">No users found.</td></tr>'}
+                    {rows if rows else '<tr><td colspan="7" style="text-align:center;">No users found.</td></tr>'}
                 </tbody>
             </table>
         </div>
 
         <script>
+            let generatedText = "";
+
             function showMsg(text, isError) {{
                 const msg = document.getElementById('message');
                 msg.className = 'message ' + (isError ? 'error' : 'success');
@@ -312,8 +326,20 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             }}
 
             function toggleAll(source) {{
-                const checkboxes = document.querySelectorAll('.user-checkbox');
-                checkboxes.forEach(cb => cb.checked = source.checked);
+                document.querySelectorAll('.user-checkbox').forEach(cb => cb.checked = source.checked);
+            }}
+
+            function showResultBox(text) {{
+                generatedText = text;
+                document.getElementById('resultText').innerText = text;
+                document.getElementById('resultBox').style.display = 'block';
+                window.scrollTo({{ top: 0, behavior: 'smooth' }});
+            }}
+
+            function copyResults() {{
+                navigator.clipboard.writeText(generatedText).then(() => {{
+                    showMsg('Copied to clipboard!', false);
+                }});
             }}
 
             // Single Create
@@ -323,9 +349,9 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                 btn.innerText = 'Creating...'; btn.disabled = true;
                 
                 const data = {{
-                    username: document.getElementById('username').value,
-                    password: document.getElementById('password').value,
-                    days_valid: parseInt(document.getElementById('days').value)
+                    username: document.getElementById('s_username').value,
+                    password: document.getElementById('s_password').value,
+                    days_valid: parseInt(document.getElementById('s_days').value)
                 }};
 
                 try {{
@@ -337,7 +363,9 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                     const result = await res.json();
                     if (res.ok) {{
                         showMsg(result.message, false);
-                        setTimeout(() => location.reload(), 1500);
+                        showResultBox(result.copy_text);
+                        e.target.reset();
+                        setTimeout(() => location.reload(), 5000); // 5 sec baad reload taaki copy kr ske
                     }} else {{
                         showMsg(result.detail || 'Error', true);
                     }}
@@ -352,28 +380,34 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             document.getElementById('createBatchForm').addEventListener('submit', async function(e) {{
                 e.preventDefault();
                 const btn = e.target.querySelector('button');
-                btn.innerText = 'Uploading...'; btn.disabled = true;
+                btn.innerText = 'Generating...'; btn.disabled = true;
                 
-                const fileInput = document.getElementById('csvFile');
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
+                const data = {{
+                    base_username: document.getElementById('b_username').value,
+                    password: document.getElementById('b_password').value,
+                    days_valid: parseInt(document.getElementById('b_days').value),
+                    quantity: parseInt(document.getElementById('b_qty').value)
+                }};
 
                 try {{
                     const res = await fetch('/admin/batch_create', {{
                         method: 'POST',
-                        body: formData
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify(data)
                     }});
                     const result = await res.json();
                     if (res.ok) {{
                         showMsg(result.message, false);
-                        setTimeout(() => location.reload(), 2000);
+                        showResultBox(result.copy_text);
+                        e.target.reset();
+                        setTimeout(() => location.reload(), 5000);
                     }} else {{
                         showMsg(result.detail || 'Error', true);
                     }}
                 }} catch (err) {{
                     showMsg('Network error!', true);
                 }} finally {{
-                    btn.innerText = 'Upload & Create'; btn.disabled = false;
+                    btn.innerText = 'Generate Batch'; btn.disabled = false;
                 }}
             }});
 
@@ -423,39 +457,68 @@ async def create_user(request: Request, session: Session = Depends(get_session))
         new_user = User(
             username=username,
             hashed_password=get_password_hash(password),
+            plain_password=password,
             valid_until=datetime.now(timezone.utc) + timedelta(days=days)
         )
         session.add(new_user); session.commit()
-        return {"message": f"User {username} created successfully"}
+        
+        expiry = datetime.now(timezone.utc) + timedelta(days=days)
+        copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n"
+        copy_text += f"───────────────────────────────\n"
+        copy_text += f"Username: {username}\n"
+        copy_text += f"Password: {password}\n"
+        copy_text += f"Valid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n"
+        copy_text += f"───────────────────────────────\n"
+        copy_text += f"🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        
+        return {"message": f"User {username} created successfully", "copy_text": copy_text}
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/batch_create")
-async def batch_create(request: Request, file: UploadFile = File(...), session: Session = Depends(get_session)):
+async def batch_create(request: Request, session: Session = Depends(get_session)):
     if not verify_admin_cookie(request): raise HTTPException(status_code=403, detail="Not authenticated")
     try:
-        contents = await file.read()
-        text = contents.decode("utf-8")
-        csv_reader = csv.reader(io.StringIO(text))
-        success_count = 0
+        data = await request.json()
+        base_username = data.get("base_username")
+        password = data.get("password")
+        days = int(data.get("days_valid"))
+        qty = int(data.get("quantity"))
+
+        if not base_username or not password or qty <= 0: 
+            raise HTTPException(status_code=400, detail="Invalid input")
         
-        for row in csv_reader:
-            if len(row) < 3: continue # Skip invalid lines
-            username, password, days = row[0].strip(), row[1].strip(), int(row[2].strip())
-            if not username or not password: continue
-            
-            if not session.exec(select(User).where(User.username == username)).first():
+        created_users = []
+        expiry = datetime.now(timezone.utc) + timedelta(days=days)
+        
+        for i in range(1, qty + 1):
+            uname = f"{base_username}{i}"
+            if not session.exec(select(User).where(User.username == uname)).first():
                 new_user = User(
-                    username=username,
+                    username=uname,
                     hashed_password=get_password_hash(password),
-                    valid_until=datetime.now(timezone.utc) + timedelta(days=days)
+                    plain_password=password,
+                    valid_until=expiry
                 )
                 session.add(new_user)
-                success_count += 1
+                created_users.append(uname)
+        
         session.commit()
-        return {"message": f"Successfully created {success_count} users"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CSV Error: {str(e)}")
+        
+        copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n"
+        copy_text += f"───────────────────────────────\n"
+        copy_text += f"Total Users: {len(created_users)}\n"
+        copy_text += f"Password: {password}\n"
+        copy_text += f"Valid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n"
+        copy_text += f"───────────────────────────────\n"
+        for u in created_users:
+            copy_text += f"{u}\n"
+        copy_text += f"───────────────────────────────\n"
+        copy_text += f"🔗 Login URL: https://mm-production-77a8128d.up.railway.app/login"
+        
+        return {"message": f"Successfully created {len(created_users)} users", "copy_text": copy_text}
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/bulk_delete")
 async def bulk_delete(request: Request, session: Session = Depends(get_session)):
