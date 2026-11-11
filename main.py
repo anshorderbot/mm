@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from passlib.context import CryptContext
@@ -78,13 +79,7 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- Admin Endpoints ---
-ADMIN_USER = "admin"
-ADMIN_PASS = "admin123" # Change this!
-
-def verify_admin(username: str, password: str):
-    return username == ADMIN_USER and password == ADMIN_PASS
-
+# --- Admin Endpoints (For API use) ---
 @app.post("/admin/create_user")
 def create_user(user_data: UserCreate, session: Session = Depends(get_session)):
     existing = session.exec(select(User).where(User.username == user_data.username)).first()
@@ -109,12 +104,146 @@ def delete_user(username: str, session: Session = Depends(get_session)):
     session.commit()
     return {"message": f"User {username} deleted"}
 
-@app.get("/admin/list_users")
-def list_users(session: Session = Depends(get_session)):
+# --- Web Admin Panel (Beautiful UI) ---
+@app.get("/", response_class=HTMLResponse)
+def admin_panel(session: Session = Depends(get_session)):
     users = session.exec(select(User)).all()
-    return users
+    
+    rows = ""
+    for u in users:
+        status = "Active" if u.is_active and u.valid_until > datetime.utcnow() else "Expired/Disabled"
+        color = "green" if status == "Active" else "red"
+        date_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
+        rows += f"""
+        <tr>
+            <td>{u.id}</td>
+            <td><b>{u.username}</b></td>
+            <td style="color:{color}; font-weight:bold;">{status}</td>
+            <td>{date_str}</td>
+            <td>
+                <form action="/admin/delete_user/{u.username}" method="POST" style="display:inline;">
+                    <button type="submit" class="btn-delete">Delete</button>
+                </form>
+            </td>
+        </tr>
+        """
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Ghost Mailer - Admin Panel</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #12141a; color: #eef0f4; margin: 0; padding: 20px; }}
+            .container {{ max-width: 900px; margin: auto; background-color: #1a1d27; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); border: 1px solid #343a4a; }}
+            h1 {{ color: #f5a524; text-align: center; margin-bottom: 30px; }}
+            h2 {{ color: #f5a524; border-bottom: 2px solid #343a4a; padding-bottom: 10px; }}
+            .form-group {{ display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }}
+            input {{ padding: 10px; border-radius: 6px; border: 1px solid #343a4a; background-color: #242836; color: #eef0f4; outline: none; flex: 1; min-width: 150px; }}
+            input:focus {{ border-color: #f5a524; }}
+            button {{ padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
+            .btn-create {{ background-color: #f5a524; color: #1a1208; flex: 0 0 auto; }}
+            .btn-create:hover {{ background-color: #ffb84d; }}
+            .btn-delete {{ background-color: #f07167; color: white; padding: 6px 12px; font-size: 12px; }}
+            .btn-delete:hover {{ background-color: #ff5c50; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #343a4a; }}
+            th {{ color: #8b93a7; font-size: 14px; text-transform: uppercase; }}
+            tr:hover {{ background-color: #242836; }}
+            .message {{ text-align: center; padding: 10px; margin-bottom: 20px; border-radius: 6px; display: none; }}
+            .success {{ background-color: #2dd4bf; color: #000; }}
+            .error {{ background-color: #f07167; color: #fff; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>👻 Ghost Mailer Admin</h1>
+            
+            <h2>Create New User</h2>
+            <div id="message" class="message"></div>
+            <form id="createForm" class="form-group">
+                <input type="text" id="username" placeholder="Username" required>
+                <input type="password" id="password" placeholder="Password" required>
+                <input type="number" id="days" placeholder="Days Valid" value="30" required>
+                <button type="submit" class="btn-create">Create User</button>
+            </form>
 
-# --- Run Server (Railway ke liye zaruri) ---
+            <h2>User List</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                        <th>Status</th>
+                        <th>Valid Until</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="userTable">
+                    {rows if rows else '<tr><td colspan="5" style="text-align:center;">No users found.</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+
+        <script>
+            document.getElementById('createForm').addEventListener('submit', async function(e) {{
+                e.preventDefault();
+                const btn = e.target.querySelector('button');
+                const msg = document.getElementById('message');
+                btn.innerText = 'Creating...';
+                btn.disabled = true;
+
+                const data = {{
+                    username: document.getElementById('username').value,
+                    password: document.getElementById('password').value,
+                    days_valid: parseInt(document.getElementById('days').value)
+                }};
+
+                try {{
+                    const response = await fetch('/admin/create_user', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        body: JSON.stringify(data)
+                    }});
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok) {{
+                        msg.className = 'message success';
+                        msg.innerText = result.message;
+                        msg.style.display = 'block';
+                        setTimeout(() => location.reload(), 1500);
+                    }} else {{
+                        msg.className = 'message error';
+                        msg.innerText = result.detail || 'Error creating user';
+                        msg.style.display = 'block';
+                    }}
+                }} catch (error) {{
+                    msg.className = 'message error';
+                    msg.innerText = 'Network error!';
+                    msg.style.display = 'block';
+                }} finally {{
+                    btn.innerText = 'Create User';
+                    btn.disabled = false;
+                }}
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
+
+@app.post("/admin/delete_user/{username}")
+def admin_delete_user(username: str, session: Session = Depends(get_session)):
+    user = session.exec(select(User).where(User.username == username)).first()
+    if user:
+        session.delete(user)
+        session.commit()
+    return HTMLResponse(content="<script>window.location.href='/'</script>")
+
+# --- Run Server ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
