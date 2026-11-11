@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import jwt
 import os
+import uvicorn
 
 # --- Configuration ---
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
@@ -77,7 +78,7 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# --- Admin Endpoints (Simple protection) ---
+# --- Admin Endpoints ---
 ADMIN_USER = "admin"
 ADMIN_PASS = "admin123" # Change this!
 
@@ -86,7 +87,6 @@ def verify_admin(username: str, password: str):
 
 @app.post("/admin/create_user")
 def create_user(user_data: UserCreate, session: Session = Depends(get_session)):
-    # Note: In real app, protect this with admin token. For simplicity, we skip auth here for demo.
     existing = session.exec(select(User).where(User.username == user_data.username)).first()
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
@@ -113,3 +113,8 @@ def delete_user(username: str, session: Session = Depends(get_session)):
 def list_users(session: Session = Depends(get_session)):
     users = session.exec(select(User)).all()
     return users
+
+# --- Run Server (Railway ke liye zaruri) ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
