@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 sqlmodel
-passlib[bcrypt]
 pyjwt
 python-multipart
+bcrypt
