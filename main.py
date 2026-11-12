@@ -40,6 +40,7 @@ class User(SQLModel, table=True):
 
 class Token(BaseModel):
     access_token: str
+    session_token: str # <--- IMPORTANT
     token_type: str
 
 class PingRequest(BaseModel):
@@ -109,7 +110,7 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     session.add(user); session.commit()
     
     access_token = create_access_token(data={"sub": user.username, "session": new_token})
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "session_token": new_token, "token_type": "bearer"}
 
 @app.post("/ping")
 def ping(req: PingRequest, session: Session = Depends(get_session)):
