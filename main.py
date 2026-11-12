@@ -14,9 +14,13 @@ import uuid
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
 ALGORITHM = "HS256"
 
+# Session considered "active" if last ping within this window.
+# Client pings every 20s -> 90s = 2 missed pings allowed before stale.
+SESSION_ACTIVE_WINDOW_SECONDS = 90
+
 # --- Admin Credentials ---
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123" 
+ADMIN_PASSWORD = "admin123"
 ADMIN_SECRET_KEY = "my-super-secret-admin-cookie-key-123"
 
 # --- Database Setup ---
@@ -40,7 +44,7 @@ class User(SQLModel, table=True):
 
 class Token(BaseModel):
     access_token: str
-    session_token: str # <--- IMPORTANT
+    session_token: str
     token_type: str
 
 class PingRequest(BaseModel):
@@ -78,6 +82,11 @@ def delete_expired_users(session: Session):
     for u in expired_users: session.delete(u)
     session.commit()
 
+def _as_utc(dt):
+    """SQLite strips tzinfo — re-attach UTC for safe arithmetic."""
+    if dt is None: return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
 # --- App ---
 app = FastAPI()
 
@@ -91,24 +100,32 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     user = session.exec(select(User).where(User.username == username)).first()
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
     if user.valid_until < datetime.now(timezone.utc):
         session.delete(user); session.commit()
         raise HTTPException(status_code=403, detail="License expired. User deleted.")
-        
+
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
 
     now = datetime.now(timezone.utc)
+
+    # If user has a live session that was active recently -> reject new login.
     if user.session_token:
-        if user.last_active and (now - user.last_active).total_seconds() < 60:
-            raise HTTPException(status_code=403, detail="Already logged in on another device.")
-    
+        last_active = _as_utc(user.last_active)
+        if last_active and (now - last_active).total_seconds() < SESSION_ACTIVE_WINDOW_SECONDS:
+            raise HTTPException(
+                status_code=409,
+                detail="Already logged in on another device. Please logout there first, "
+                       "or wait ~90s for that session to expire."
+            )
+        # Session is stale -> safe to overwrite
+
     new_token = str(uuid.uuid4())
     user.session_token = new_token
     user.last_active = now
     session.add(user); session.commit()
-    
+
     access_token = create_access_token(data={"sub": user.username, "session": new_token})
     return {"access_token": access_token, "session_token": new_token, "token_type": "bearer"}
 
@@ -117,12 +134,22 @@ def ping(req: PingRequest, session: Session = Depends(get_session)):
     user = session.exec(select(User).where(User.username == req.username)).first()
     if not user or user.session_token != req.token:
         raise HTTPException(status_code=401, detail="Session invalid or logged out by admin")
-    
-    if user.valid_until < datetime.now(timezone.utc):
+
+    now = datetime.now(timezone.utc)
+
+    if user.valid_until < now:
         session.delete(user); session.commit()
         raise HTTPException(status_code=401, detail="License expired")
-        
-    user.last_active = datetime.now(timezone.utc)
+
+    # Expire session if idle too long (defensive — client should ping faster)
+    last_active = _as_utc(user.last_active)
+    if last_active and (now - last_active).total_seconds() > SESSION_ACTIVE_WINDOW_SECONDS * 2:
+        user.session_token = None
+        user.last_active = None
+        session.add(user); session.commit()
+        raise HTTPException(status_code=401, detail="Session expired due to inactivity")
+
+    user.last_active = now
     session.add(user); session.commit()
     return {"status": "ok"}
 
@@ -169,7 +196,7 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
     if not verify_admin_cookie(request): return RedirectResponse(url="/admin/login", status_code=status.HTTP_303_SEE_OTHER)
     delete_expired_users(session)
     users = session.exec(select(User).order_by(User.id.desc())).all()
-    
+
     rows = ""
     now = datetime.now(timezone.utc)
     for u in users:
@@ -177,15 +204,17 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
         valid_str = u.valid_until.strftime("%Y-%m-%d %H:%M")
         is_online = False
         if u.session_token and u.last_active:
-            if (now - u.last_active).total_seconds() < 60: is_online = True
-                
+            la = _as_utc(u.last_active)
+            if (now - la).total_seconds() < SESSION_ACTIVE_WINDOW_SECONDS:
+                is_online = True
+
         if is_online:
             login_status = '<span style="color:#2dd4bf; font-weight:bold;">🟢 Logged In</span>'
             action_btn = f'<button onclick="forceLogout(\'{u.username}\')" class="btn btn-force-logout">Force Logout</button>'
         else:
             login_status = '<span style="color:#8b93a7;">🔴 Offline</span>'
             action_btn = '-'
-            
+
         rows += f"""
         <tr>
             <td><input type="checkbox" class="user-checkbox" value="{u.username}"></td>
@@ -193,7 +222,7 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             <td style="color:{color}; font-weight:bold;">{status_text}</td><td>{valid_str}</td><td>{login_status}</td><td>{action_btn}</td>
         </tr>
         """
-    
+
     return f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -210,16 +239,16 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
             .btn-primary {{ background-color: #f5a524; color: #1a1208; }}
             .btn-delete {{ background-color: transparent; color: #f07167; border: 1px solid #f07167; padding: 8px 15px; font-size: 13px; border-radius: 6px; cursor:pointer; font-weight:bold;}}
             .btn-force-logout {{ background-color: transparent; color: #f5a524; border: 1px solid #f5a524; padding: 5px 10px; font-size: 12px; border-radius: 4px; cursor:pointer; }}
-            
+
             .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
             .box {{ background-color: #242836; padding: 20px; border-radius: 8px; border: 1px solid #343a4a; }}
             input[type="text"], input[type="password"], input[type="number"] {{ width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 6px; border: 1px solid #343a4a; background-color: #1a1d27; color: #eef0f4; box-sizing: border-box; outline: none; }}
-            
+
             table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
             th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #343a4a; }}
             th {{ color: #8b93a7; font-size: 13px; text-transform: uppercase; }}
             tr:hover {{ background-color: #2a2e3d; }}
-            
+
             .result-box {{ display: none; background: linear-gradient(135deg, #1a1d27, #242836); border: 1px solid #f5a524; border-radius: 8px; padding: 20px; margin-bottom: 20px; position: relative; }}
             .result-box h3 {{ color: #f5a524; margin-top: 0; }} .result-text {{ background-color: #0e1016; padding: 15px; border-radius: 6px; color: #eef0f4; font-family: monospace; white-space: pre-wrap; font-size: 14px; max-height: 200px; overflow-y: auto; }}
             .btn-copy {{ position: absolute; top: 15px; right: 15px; background-color: #2dd4bf; color: #000; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }}
@@ -233,7 +262,7 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                 <h1>👻 Ghost Mailer Admin</h1>
                 <a href="/admin/logout" class="btn btn-logout">Logout</a>
             </div>
-            
+
             <div id="message" class="message"></div>
             <div id="resultBox" class="result-box">
                 <h3>🎉 Generated Users</h3>
@@ -267,7 +296,7 @@ def admin_dashboard(request: Request, session: Session = Depends(get_session)):
                 <h2>User List</h2>
                 <button type="button" class="btn btn-delete" onclick="deleteSelected()">Delete Selected</button>
             </div>
-            
+
             <table>
                 <thead>
                     <tr>
@@ -351,10 +380,10 @@ async def create_user(request: Request, session: Session = Depends(get_session))
         username, password, days = data.get("username"), data.get("password"), int(data.get("days_valid"))
         if not username or not password: raise HTTPException(status_code=400, detail="Required fields missing")
         if session.exec(select(User).where(User.username == username)).first(): raise HTTPException(status_code=400, detail="User exists")
-        
+
         new_user = User(username=username, hashed_password=get_password_hash(password), plain_password=password, valid_until=datetime.now(timezone.utc) + timedelta(days=days))
         session.add(new_user); session.commit()
-        
+
         expiry = datetime.now(timezone.utc) + timedelta(days=days)
         copy_text = f"👻 GHOST MAILER - USER DETAILS 👻\n───────────────────────────────\nUsername: {username}\nPassword: {password}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n🔗 Login URL: https://mm-production-d4739aa7.up.railway.app/login"
         return {"message": f"User {username} created", "copy_text": copy_text}
@@ -375,7 +404,7 @@ async def batch_create(request: Request, session: Session = Depends(get_session)
                 session.add(User(username=uname, hashed_password=get_password_hash(pwd), plain_password=pwd, valid_until=expiry))
                 created.append(uname)
         session.commit()
-        
+
         copy_text = f"👻 GHOST MAILER - BATCH USERS 👻\n───────────────────────────────\nTotal: {len(created)}\nPassword: {pwd}\nValid Until: {expiry.strftime('%Y-%m-%d %H:%M')}\n───────────────────────────────\n" + "\n".join(created) + f"\n───────────────────────────────\n🔗 Login URL: https://mm-production-d4739aa7.up.railway.app/login"
         return {"message": f"Created {len(created)} users", "copy_text": copy_text}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
