@@ -40,8 +40,13 @@ class User(SQLModel, table=True):
 
 class Token(BaseModel):
     access_token: str
-    session_token: str # <--- IMPORTANT
+    session_token: str
     token_type: str
+
+# FIX: LoginRequest model for JSON body
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 class PingRequest(BaseModel):
     username: str
@@ -87,7 +92,11 @@ def on_startup():
 
 # --- Client API Endpoints ---
 @app.post("/login", response_model=Token)
-def login(username: str, password: str, session: Session = Depends(get_session)):
+def login(req: LoginRequest, session: Session = Depends(get_session)):
+    # FIX: Read from JSON body, not query params
+    username = req.username
+    password = req.password
+
     user = session.exec(select(User).where(User.username == username)).first()
     if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -99,14 +108,16 @@ def login(username: str, password: str, session: Session = Depends(get_session))
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    now = datetime.now(timezone.utc)
+    # FIX: Strict single-login — session_token present means someone is logged in
     if user.session_token:
-        if user.last_active and (now - user.last_active).total_seconds() < 60:
-            raise HTTPException(status_code=403, detail="Already logged in on another device.")
+        raise HTTPException(
+            status_code=409,
+            detail="Already logged in on another device. Ask admin to force logout, or log out from the other device first."
+        )
     
     new_token = str(uuid.uuid4())
     user.session_token = new_token
-    user.last_active = now
+    user.last_active = datetime.now(timezone.utc)
     session.add(user); session.commit()
     
     access_token = create_access_token(data={"sub": user.username, "session": new_token})
